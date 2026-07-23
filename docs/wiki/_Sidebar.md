@@ -16,6 +16,7 @@
 ### Features
 
 * [NeX-Up (Trailers)](NeX-Up)
+* [Community Prerolls](Community-Prerolls)
 * [Sequences](Sequences)
 * [Scheduling Guide](Scheduling)
 * [Path Mappings](Path-Mappings)
@@ -26,6 +27,7 @@
 * [API Documentation](API)
 * [Troubleshooting](Troubleshooting)
 * [FAQ](FAQ)
+* [Release Notes](https://github.com/JFLXCLOUD/NeXroll/releases)
 
 ### Links
 

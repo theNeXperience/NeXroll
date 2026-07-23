@@ -19,13 +19,29 @@ from backend.database import SessionLocal
 
 # Logging helpers - direct file writes to avoid circular imports
 def _get_log_path():
-    """Get the log file path"""
+    """Get the log file path.
+
+    Mirrors main._ensure_log_dir's fallback chain so the scheduler writes to the
+    SAME app.log as the FastAPI app (can't import main here — circular import).
+    Historically this used /var/log/nexroll on Linux while the app wrote to
+    <cwd>/logs, so Docker diagnostics bundles were missing every SCHEDULER line.
+    """
+    candidates = []
     if sys.platform == "win32":
-        log_dir = os.path.join(os.environ.get("PROGRAMDATA", "C:\\ProgramData"), "NeXroll", "logs")
-    else:
-        log_dir = "/var/log/nexroll"
-    os.makedirs(log_dir, exist_ok=True)
-    return os.path.join(log_dir, "app.log")
+        base = os.environ.get("PROGRAMDATA")
+        if base:
+            candidates.append(os.path.join(base, "NeXroll", "logs"))
+        la = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if la:
+            candidates.append(os.path.join(la, "NeXroll", "logs"))
+    candidates.append(os.path.join(os.getcwd(), "logs"))
+    for log_dir in candidates:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            return os.path.join(log_dir, "app.log")
+        except Exception:
+            continue
+    return os.path.join(os.getcwd(), "app.log")
 
 _scheduler_rotation_cache = {"last_check": 0}
 
@@ -70,6 +86,81 @@ def _scheduler_verbose(msg: str):
             db.close()
     except Exception:
         pass
+
+
+def _localized_now(db: Session = None) -> datetime.datetime:
+    """
+    Return "now" as a naive datetime representing wall-clock time in the
+    app's configured Setting.timezone, for comparison against schedule
+    start/end dates and recurrence time-ranges (which are stored as naive
+    local datetimes/strings).
+
+    Deliberately uses datetime.now(tz) — which derives local time from the
+    system's UTC clock plus pytz's bundled IANA database — rather than the
+    bare datetime.now() the scheduler used previously, which just reads
+    whatever local time the OS/container reports. Those can silently
+    diverge (e.g. a container missing tzdata, or TZ set but not actually
+    honored by the base image) even when Setting.timezone is configured
+    correctly, which is what let the scheduler evaluate schedules against
+    the wrong day/hour while the UI's own clock (browser-side) stayed correct.
+    """
+    own_session = db is None
+    if own_session:
+        db = SessionLocal()
+    try:
+        setting = db.query(models.Setting).first()
+        tz_name = getattr(setting, "timezone", None) if setting else None
+    except Exception:
+        tz_name = None
+    finally:
+        if own_session:
+            db.close()
+    try:
+        tz = pytz.timezone(tz_name or "UTC")
+    except Exception:
+        tz = pytz.utc
+    return datetime.datetime.now(tz).replace(tzinfo=None)
+
+def resolve_nexup_trailer_block(block: dict, db) -> list:
+    """Resolve a 'nexup_trailers' sequence/filler step to ordered trailer rows.
+
+    Mirror of main.resolve_nexup_trailer_block (kept here to avoid importing the
+    FastAPI app module into the scheduler thread). Honors:
+      source: 'both'|'movies'|'tv'   mode: 'random'|'sequential'   count: int
+    Random = sample; Sequential = soonest release first. Eligible = any
+    downloaded + enabled trailer whose file exists (NOT filtered by release
+    date — see main.resolve_nexup_trailer_block for why).
+    """
+    source = str(block.get("source", "both")).lower()
+    mode = str(block.get("mode", "random")).lower()
+    try:
+        count = int(block.get("count") or 2)
+    except Exception:
+        count = 2
+    count = max(count, 1)
+
+    rows = []
+    if source in ("movies", "both"):
+        rows += [t for t in db.query(models.ComingSoonTrailer).filter(
+            models.ComingSoonTrailer.status == 'downloaded',
+            models.ComingSoonTrailer.is_enabled == True,
+        ).all() if t.local_path and os.path.exists(t.local_path)]
+    if source in ("tv", "both"):
+        rows += [t for t in db.query(models.ComingSoonTVTrailer).filter(
+            models.ComingSoonTVTrailer.status == 'downloaded',
+            models.ComingSoonTVTrailer.is_enabled == True,
+        ).all() if t.local_path and os.path.exists(t.local_path)]
+
+    if not rows:
+        return []
+    if mode == "sequential":
+        rows.sort(key=lambda t: (t.release_date is None, t.release_date))
+        return rows[:count]
+    if len(rows) > count:
+        return random.sample(rows, count)
+    random.shuffle(rows)
+    return rows
+
 
 def _has_valid_sequence(schedule) -> bool:
     """Check if a schedule has a valid, non-empty sequence definition.
@@ -145,8 +236,6 @@ class Scheduler:
         # Track last rotation time for random blocks (schedule_id -> last_rotation_time)
         self._last_rotation_time: dict[int, datetime.datetime] = {}
         self._rotation_interval_seconds: float = 600.0  # 10 minute rotation interval
-        # Cache for holiday dates (holiday_name_country_year -> date)
-        self._holiday_date_cache: dict[str, Optional[datetime.date]] = {}
         # Track blend mode state for verification
         self._blend_mode_active: bool = False
         self._blend_expected_preroll: Optional[str] = None
@@ -154,6 +243,7 @@ class Scheduler:
         self._last_nexup_sync_time: Optional[datetime.datetime] = None
         # Track last log-retention cleanup (runs ~once/day from the loop)
         self._last_log_cleanup_time: Optional[datetime.datetime] = None
+        self._last_trailer_cleanup_time: Optional[datetime.datetime] = None
         # Automatic preroll-folder scan runs in its own isolated thread so it can
         # never block or crash the scheduler loop.
         self._last_preroll_scan_time: Optional[datetime.datetime] = None
@@ -322,6 +412,11 @@ class Scheduler:
                 self._maybe_cleanup_logs()
             except Exception as e:
                 _scheduler_log(f"Log cleanup error: {e}", level="ERROR")
+            try:
+                # Enforce NeX-Up trailer retention ~once per hour
+                self._maybe_cleanup_trailers()
+            except Exception as e:
+                _scheduler_log(f"Trailer retention cleanup error: {e}", level="ERROR")
             # NOTE: automatic preroll-folder scanning runs in its OWN dedicated
             # thread (_run_autoscan_loop), NOT here. The scan walks the disk and
             # may spawn ffmpeg for thumbnails; keeping it off the scheduler loop
@@ -408,6 +503,67 @@ class Scheduler:
         deleted = cleanup_old_logs()
         if deleted:
             _scheduler_log(f"Log retention: pruned {deleted} log entries older than retention window")
+
+    def _maybe_cleanup_trailers(self):
+        """Delete downloaded NeX-Up trailers older than the retention window
+        (nexup_trailer_retention_days; 0 = keep forever). Runs at most hourly.
+
+        Removal is measured from the LATER of download time and release date —
+        the same basis the Your Trailers page shows as each trailer's removal
+        date — so a trailer for a movie that hasn't released yet is never reaped
+        early. This is separate from the library-arrival cleanup in the sync
+        (movie now in your library), which is event-based; this is the time-based
+        retention the setting promised but never previously enforced.
+        """
+        now = datetime.datetime.utcnow()
+        last = self._last_trailer_cleanup_time
+        if last is not None and (now - last).total_seconds() < 3600:
+            return
+        self._last_trailer_cleanup_time = now
+
+        db = SessionLocal()
+        try:
+            setting = db.query(models.Setting).first()
+            days = getattr(setting, "nexup_trailer_retention_days", 7) if setting else 7
+            try:
+                days = int(days)
+            except Exception:
+                days = 7
+            if days <= 0:
+                return  # 0 = keep forever
+            cutoff = now - datetime.timedelta(days=days)
+            removed = 0
+            for model in (models.ComingSoonTrailer, models.ComingSoonTVTrailer):
+                # Anchor retention on the LATER of download time and release date,
+                # so a still-upcoming movie's trailer is never reaped before the
+                # movie is even out (an early download would otherwise be removed
+                # well before its release). A trailer is only old enough to remove
+                # once BOTH its download and its release are past the cutoff.
+                old = db.query(model).filter(
+                    model.status == 'downloaded',
+                    model.downloaded_at != None,  # noqa: E711 (SQLAlchemy NULL check)
+                    model.downloaded_at < cutoff,
+                    or_(model.release_date == None, model.release_date < cutoff),  # noqa: E711
+                ).all()
+                for t in old:
+                    if t.local_path and os.path.exists(t.local_path):
+                        try:
+                            os.remove(t.local_path)
+                        except Exception:
+                            pass
+                    db.delete(t)
+                    removed += 1
+            if removed:
+                db.commit()
+                _scheduler_log(f"NeX-Up trailer retention: removed {removed} trailer(s) older than {days} day(s)")
+        except Exception as e:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            _scheduler_log(f"Trailer retention cleanup failed: {e}", level="ERROR")
+        finally:
+            db.close()
 
     def _check_nexup_auto_sync(self):
         """
@@ -1065,12 +1221,12 @@ class Scheduler:
                     
                     if connector.set_item_intros(item_id, intro_data):
                         applied_count += 1
-                        _scheduler_verbose(f"  ✓ Applied intro to: {item_name}")
+                        _scheduler_verbose(f"  Applied intro to: {item_name}")
                     else:
-                        _scheduler_log(f"  ✗ Failed to apply intro to: {item_name}", level="ERROR")
+                        _scheduler_log(f"  Failed to apply intro to: {item_name}", level="ERROR")
                 
                 except Exception as e:
-                    _scheduler_log(f"  ✗ Error applying to item: {e}", level="ERROR")
+                    _scheduler_log(f"  Error applying to item: {e}", level="ERROR")
                     continue
             
             _scheduler_log(f"Successfully applied prerolls to {applied_count}/{len(search_results)} Jellyfin items.")
@@ -1294,8 +1450,8 @@ class Scheduler:
             if priority_mode == "schedules_override":
                 # Check if any schedule is currently active
                 schedules = db.query(models.Schedule).filter(models.Schedule.is_active == True).all()
-                # Use local time for comparisons since schedules are stored as naive local datetimes
-                now = datetime.datetime.now()
+                # Use local time (per Setting.timezone) for comparisons since schedules are stored as naive local datetimes
+                now = _localized_now(db)
                 active_schedules = [s for s in schedules if self._is_schedule_active(s, now)]
                 if active_schedules:
                     _scheduler_log(f"Skipping genre mapping for ratingKey={chosen_key} due to active schedule (priority mode: {priority_mode})")
@@ -1357,8 +1513,8 @@ class Scheduler:
         """Evaluate schedules, apply active category to Plex, and handle fallback when idle."""
         db = SessionLocal()
         try:
-            # Use local time for comparisons since schedules are stored as naive local datetimes
-            now = datetime.datetime.now()
+            # Use local time (per Setting.timezone) for comparisons since schedules are stored as naive local datetimes
+            now = _localized_now(db)
             schedules = db.query(models.Schedule).filter(models.Schedule.is_active == True).all()
 
             # Determine active schedules (window-aware)
@@ -2073,6 +2229,12 @@ class Scheduler:
             h_country = getattr(schedule, "holiday_country", None)
             if h_name and h_country:
                 holiday_date = self._get_holiday_date(h_name, h_country, now.year)
+                if holiday_date is None:
+                    # Holiday API unavailable this tick — fall back to the schedule's
+                    # stored start_date (kept current for the year by the holiday
+                    # auto-refresh) so a transient lookup failure can't flip the
+                    # schedule inactive and alternate which schedule wins.
+                    holiday_date = getattr(schedule, "start_date", None)
                 if holiday_date:
                     if not (now.month == holiday_date.month and now.day == holiday_date.day):
                         _scheduler_verbose(f"Schedule '{schedule.name}' (yearly/holiday-dynamic) not active: "
@@ -2120,6 +2282,11 @@ class Scheduler:
             h_country = getattr(schedule, "holiday_country", None)
             if h_name and h_country:
                 holiday_date = self._get_holiday_date(h_name, h_country, now.year)
+                if holiday_date is None:
+                    # Holiday API unavailable this tick — fall back to the schedule's
+                    # stored start_date so a transient lookup failure can't flip the
+                    # schedule inactive and alternate which schedule wins.
+                    holiday_date = getattr(schedule, "start_date", None)
                 if holiday_date:
                     if not (now.month == holiday_date.month and now.day == holiday_date.day):
                         _scheduler_verbose(f"Schedule '{schedule.name}' (holiday) not active: "
@@ -2530,37 +2697,11 @@ class Scheduler:
                         paths.append(os.path.abspath(p.path))
             elif stype == "nexup_trailers":
                 # NeX-Up trailers from coming_soon_trailers / coming_soon_tv_trailers
-                source = str(step.get("source", "both")).lower()
-                try:
-                    count = int(step.get("count") or 2)
-                except Exception:
-                    count = 2
-                now = datetime.datetime.now()
-                trailer_paths = []
-                if source in ("movies", "both"):
-                    movie_trailers = db.query(models.ComingSoonTrailer).filter(
-                        models.ComingSoonTrailer.status == 'downloaded',
-                        models.ComingSoonTrailer.is_enabled == True,
-                        models.ComingSoonTrailer.release_date >= now
-                    ).all()
-                    for t in movie_trailers:
-                        if t.local_path and os.path.exists(t.local_path):
-                            trailer_paths.append(os.path.abspath(t.local_path))
-                if source in ("tv", "both"):
-                    tv_trailers = db.query(models.ComingSoonTVTrailer).filter(
-                        models.ComingSoonTVTrailer.status == 'downloaded',
-                        models.ComingSoonTVTrailer.is_enabled == True,
-                        models.ComingSoonTVTrailer.release_date >= now
-                    ).all()
-                    for t in tv_trailers:
-                        if t.local_path and os.path.exists(t.local_path):
-                            trailer_paths.append(os.path.abspath(t.local_path))
-                if trailer_paths:
-                    k = min(max(count, 1), len(trailer_paths))
-                    picks = random.sample(trailer_paths, k) if len(trailer_paths) > k else trailer_paths
-                    paths.extend(picks)
+                picked = resolve_nexup_trailer_block(step, db)
+                if picked:
+                    paths.extend(os.path.abspath(t.local_path) for t in picked)
                 else:
-                    _scheduler_log(f"Sequence: No NeX-Up trailers available (source={source})", level="WARNING")
+                    _scheduler_log(f"Sequence: No NeX-Up trailers available (source={step.get('source','both')})", level="WARNING")
             elif stype == "coming_soon_list":
                 # Coming Soon List dynamic video (grid or list layout)
                 layout = str(step.get("layout", "grid")).lower()
@@ -2785,33 +2926,8 @@ class Scheduler:
                                     if p:
                                         paths.append(os.path.abspath(p.path))
                             elif stype == "nexup_trailers":
-                                source = str(step.get("source", "both")).lower()
-                                try:
-                                    count = int(step.get("count") or 2)
-                                except Exception:
-                                    count = 2
-                                now = datetime.datetime.now()
-                                trailer_paths = []
-                                if source in ("movies", "both"):
-                                    for t in db.query(models.ComingSoonTrailer).filter(
-                                        models.ComingSoonTrailer.status == 'downloaded',
-                                        models.ComingSoonTrailer.is_enabled == True,
-                                        models.ComingSoonTrailer.release_date >= now
-                                    ).all():
-                                        if t.local_path and os.path.exists(t.local_path):
-                                            trailer_paths.append(os.path.abspath(t.local_path))
-                                if source in ("tv", "both"):
-                                    for t in db.query(models.ComingSoonTVTrailer).filter(
-                                        models.ComingSoonTVTrailer.status == 'downloaded',
-                                        models.ComingSoonTVTrailer.is_enabled == True,
-                                        models.ComingSoonTVTrailer.release_date >= now
-                                    ).all():
-                                        if t.local_path and os.path.exists(t.local_path):
-                                            trailer_paths.append(os.path.abspath(t.local_path))
-                                if trailer_paths:
-                                    k = min(max(count, 1), len(trailer_paths))
-                                    picks = random.sample(trailer_paths, k) if len(trailer_paths) > k else trailer_paths
-                                    paths.extend(picks)
+                                paths.extend(os.path.abspath(t.local_path)
+                                             for t in resolve_nexup_trailer_block(step, db))
                             elif stype == "coming_soon_list":
                                 layout = str(step.get("layout", "grid")).lower()
                                 blend_setting = db.query(models.Setting).first()
@@ -2999,37 +3115,11 @@ class Scheduler:
                             paths.append(os.path.abspath(p.path))
                 
                 elif block_type == "nexup_trailers":
-                    source = str(block.get("source", "both")).lower()
-                    try:
-                        count = int(block.get("count") or 2)
-                    except Exception:
-                        count = 2
-                    now = datetime.datetime.now()
-                    trailer_paths = []
-                    if source in ("movies", "both"):
-                        movie_trailers = db.query(models.ComingSoonTrailer).filter(
-                            models.ComingSoonTrailer.status == 'downloaded',
-                            models.ComingSoonTrailer.is_enabled == True,
-                            models.ComingSoonTrailer.release_date >= now
-                        ).all()
-                        for t in movie_trailers:
-                            if t.local_path and os.path.exists(t.local_path):
-                                trailer_paths.append(os.path.abspath(t.local_path))
-                    if source in ("tv", "both"):
-                        tv_trailers = db.query(models.ComingSoonTVTrailer).filter(
-                            models.ComingSoonTVTrailer.status == 'downloaded',
-                            models.ComingSoonTVTrailer.is_enabled == True,
-                            models.ComingSoonTVTrailer.release_date >= now
-                        ).all()
-                        for t in tv_trailers:
-                            if t.local_path and os.path.exists(t.local_path):
-                                trailer_paths.append(os.path.abspath(t.local_path))
-                    if trailer_paths:
-                        k = min(max(count, 1), len(trailer_paths))
-                        picks = random.sample(trailer_paths, k) if len(trailer_paths) > k else trailer_paths
-                        paths.extend(picks)
+                    picked = resolve_nexup_trailer_block(block, db)
+                    if picked:
+                        paths.extend(os.path.abspath(t.local_path) for t in picked)
                     else:
-                        _scheduler_log(f"FILLER: No NeX-Up trailers available (source={source})", level="WARNING")
+                        _scheduler_log(f"FILLER: No NeX-Up trailers available (source={block.get('source','both')})", level="WARNING")
                 
                 elif block_type == "coming_soon_list":
                     layout = str(block.get("layout", "grid")).lower()
@@ -3235,8 +3325,8 @@ class Scheduler:
         """Return a list of schedules currently active (for diagnostics/status)."""
         db = SessionLocal()
         try:
-            # Use local time for comparisons since schedules are stored as naive local datetimes
-            now = datetime.datetime.now()
+            # Use local time (per Setting.timezone) for comparisons since schedules are stored as naive local datetimes
+            now = _localized_now(db)
             schedules = db.query(models.Schedule).filter(models.Schedule.is_active == True).all()
             return [s for s in schedules if self._is_schedule_active(s, now)]
         finally:
@@ -3246,48 +3336,39 @@ class Scheduler:
         """
         Look up the date for a holiday in a specific year using the Holiday API.
         This handles variable-date holidays like Thanksgiving, Easter, etc.
-        
+
         Args:
             holiday_name: Name of the holiday (e.g., "Thanksgiving")
             country_code: ISO country code (e.g., "US")
             year: Year to look up
-            
+
         Returns:
             datetime.date object if found, None otherwise
+
+        No caching here beyond HolidayAPI.get_holidays()'s own TTL cache - an
+        earlier per-(name,country,year) cache stored a "not found" result
+        forever, so a transient API failure early in the year permanently
+        blinded the scheduler to that holiday until process restart. A fresh
+        lookup here is cheap (get_holidays() is itself cached), so it's safe
+        to just re-derive on every call.
         """
-        # Check cache first
-        cache_key = f"{holiday_name}_{country_code}_{year}"
-        if cache_key in self._holiday_date_cache:
-            return self._holiday_date_cache[cache_key]
-        
         try:
-            # Import Holiday API
             from backend.holiday_api import HolidayAPI
-            
-            # Fetch holidays for this country and year
-            holidays = HolidayAPI.get_holidays(country_code, year)
-            
-            # Find matching holiday (case-insensitive)
-            holiday_name_lower = holiday_name.lower()
-            for holiday in holidays:
-                if holiday_name_lower in holiday.get('name', '').lower():
-                    # Found it! Parse the date
-                    holiday_date_str = holiday.get('date')
-                    if holiday_date_str:
-                        holiday_date = datetime.datetime.strptime(holiday_date_str, '%Y-%m-%d').date()
-                        # Cache it
-                        self._holiday_date_cache[cache_key] = holiday_date
-                        _scheduler_log(f"Found {holiday_name} in {country_code} {year}: {holiday_date}")
-                        return holiday_date
-            
-            # Not found - cache None to avoid repeated API calls
-            self._holiday_date_cache[cache_key] = None
-            _scheduler_log(f"Holiday '{holiday_name}' not found in {country_code} {year}", level="WARNING")
+
+            # search_holiday_by_name does an exact (case-insensitive) match
+            # before falling back to substring matching, so a schedule named
+            # "Christmas" can't silently resolve to "Christmas Eve" or similar.
+            holiday = HolidayAPI.search_holiday_by_name(holiday_name, (country_code or "").upper(), year)
+            if holiday and holiday.get("date"):
+                holiday_date = datetime.datetime.strptime(holiday["date"], "%Y-%m-%d").date()
+                _scheduler_verbose(f"Found {holiday_name} in {country_code} {year}: {holiday_date}")
+                return holiday_date
+
+            _scheduler_verbose(f"Holiday '{holiday_name}' not found in {country_code} {year}")
             return None
-            
+
         except Exception as e:
             _scheduler_log(f"SCHEDULER: Error looking up holiday date: {e}", level="ERROR")
-            # Don't cache errors - try again next time
             return None
 
     def _execute_schedule(self, schedule: models.Schedule, db: Session):
@@ -3449,8 +3530,8 @@ class Scheduler:
 
     def _calculate_next_run(self, schedule: models.Schedule) -> Optional[datetime.datetime]:
         """Calculate when this schedule should run next"""
-        # Use local time for comparisons since schedules are stored as naive local datetimes
-        now = datetime.datetime.now()
+        # Use local time (per Setting.timezone) for comparisons since schedules are stored as naive local datetimes
+        now = _localized_now()
 
         if schedule.type == "monthly":
             # Next month, same day
